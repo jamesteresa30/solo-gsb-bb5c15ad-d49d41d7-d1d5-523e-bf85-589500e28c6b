@@ -305,6 +305,21 @@ def test_http_validation_error_is_422():
     assert any(e["type"] == "unknown_bucket_ref" for e in detail)
 
 
+def test_http_value_error_is_422_not_500():
+    # 校验器抛出的 ValueError（initial > capacity）含不可序列化的 ctx.error，
+    # 必须仍按 422 结构返回而非 500
+    response = client.post(
+        "/simulate",
+        json={
+            "buckets": [{"id": "A", "capacity": 5, "refill_rate": 1, "initial": 6}],
+            "requests": [{"id": "r", "timestamp": 0, "cost": 1, "chain": ["A"]}],
+        },
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and detail
+
+
 def test_http_health_and_root():
     assert client.get("/health").json() == {"status": "ok"}
     assert client.get("/").status_code == 200

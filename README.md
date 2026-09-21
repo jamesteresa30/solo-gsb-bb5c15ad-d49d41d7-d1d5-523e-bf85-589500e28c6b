@@ -9,6 +9,8 @@
 
 另提供 **等待时间预测** 接口 `POST /forecast`：给定当前时刻各桶快照（容量/速率/当前余额）、请求成本与桶链，在**不扣减任何状态**的前提下，计算链上全部桶首次同时满足成本所需的等待秒数，返回预计可通过时刻、等待最长的限制桶与各桶预计余额；零速率或容量不足导致永远不可达时返回明确的不可达标记。
 
+以及 **初始余额规划** 接口 `POST /plan-initial-balances`：请求体与 `/simulate` 相同，以**所有请求均获放行**为目标，在 `[0, capacity]` 内为每个桶反推满足其全部链上消耗的最低 `initial`（误差 ≤ 1e-6），返回各桶 `required_initial`、相对请求 `initial` 的 `delta` 以及用规划值完整回放得到的 `final_balances`；满桶起步仍不可行时返回 `reachable = false` 与按处理顺序首个无法满足的请求和桶。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -24,6 +26,7 @@ docker compose up --build
 | 健康检查 | http://localhost:8000/health |
 | 试算接口 | http://localhost:8000/simulate （POST） |
 | 预测接口 | http://localhost:8000/forecast （POST） |
+| 规划接口 | http://localhost:8000/plan-initial-balances （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -186,6 +189,68 @@ docker compose up --build
 }
 ```
 
+## 请求格式 `POST /plan-initial-balances`
+
+请求体与 `/simulate` **完全相同**（`buckets` + `requests`，字段与校验规则一致，`initial` 缺省仍按 `capacity` 计）。接口以**所有请求均获放行**为目标，按与 `/simulate` 相同的时间排序与连续补充语义，为每个桶在 `[0, capacity]` 内反推满足其全部链上消耗的最低初始余额。
+
+```json
+{
+  "buckets": [
+    {"id": "tenant_quota", "capacity": 100, "refill_rate": 10},
+    {"id": "api_qps", "capacity": 8, "refill_rate": 5},
+    {"id": "user_quota", "capacity": 20, "refill_rate": 1, "initial": 3}
+  ],
+  "requests": [
+    {"id": "req-1", "timestamp": 0, "cost": 4, "chain": ["tenant_quota", "api_qps", "user_quota"]},
+    {"id": "req-2", "timestamp": 0, "cost": 4, "chain": ["tenant_quota", "api_qps"]},
+    {"id": "req-3", "timestamp": 1, "cost": 4, "chain": ["tenant_quota", "api_qps"]},
+    {"id": "req-4", "timestamp": 2, "cost": 4, "chain": ["tenant_quota", "api_qps", "user_quota"]}
+  ]
+}
+```
+
+### 规划语义
+
+1. **目标全量计入**：规划假设每个请求都会放行，链上每个桶都按 `cost` 全量扣减——即使某请求在真实模拟中会因其他桶暂时不足而被原子拒绝，它对链上各桶的消耗也必须计入，不得跳过。
+2. **时间顺序与连续补充**：与 `/simulate` 一致——按 `timestamp` 升序（同刻按输入顺序）处理；`initial` 在最早请求时刻持有，之后按 `(时间差) × refill_rate` 连续补充、封顶 `capacity`。
+3. **最低 initial**：对每个桶独立反推（自最后一个消耗事件向前递推，跨过补充区间时减去 `refill_rate × 时间差`、不下穿 0），给出恰好满足其全部链上消耗的最低初始余额，误差不超过 1e-6；从未被任何链引用的桶 `required_initial` 为 0。
+4. **不可行**：若满桶起步（`initial = capacity`）仍无法让全部请求放行，返回 `reachable = false`，`first_failure` 指出**按处理顺序**首个无法满足的请求与桶（同一请求多个桶不足时取链上首个），此时 `buckets` 与 `final_balances` 为 `null`。
+5. **可行**：返回各桶 `required_initial`、相对请求 `initial` 的 `delta`（= `required_initial` − 请求 `initial`，缺省按 `capacity` 计；为正表示请求初始余额不足），以及**用规划值完整回放**得到的 `final_balances`（回放中所有请求均放行）。
+
+### 响应示例（可行）
+
+```json
+{
+  "reachable": true,
+  "buckets": [
+    {"id": "tenant_quota", "required_initial": 8.0, "requested_initial": 100.0, "delta": -92.0},
+    {"id": "api_qps", "required_initial": 8.0, "requested_initial": 8.0, "delta": 0.0},
+    {"id": "user_quota", "required_initial": 6.0, "requested_initial": 3.0, "delta": 3.0}
+  ],
+  "final_balances": {"tenant_quota": 12.0, "api_qps": 2.0, "user_quota": 0.0},
+  "first_failure": null
+}
+```
+
+- `tenant_quota`：`t=0` 连扣两笔 4，之后每秒补 10 足够覆盖后续请求 → 最低 8；
+- `api_qps`：`t=0` 两笔 4 恰好占满容量 → 最低 8（请求的缺省 initial 正好够用，`delta = 0`）；
+- `user_quota`：`t=0` 扣 4，`t=2` 前只能补 2，还需 2 → 最低 6，比请求的 `initial: 3` 多 3。
+
+### 响应示例（不可行）
+
+把上例中 `api_qps` 的 `capacity` 改为 5：`t=0` 的 req-1 + req-2 共需 8，满桶 5 也无法满足。
+
+```json
+{
+  "reachable": false,
+  "buckets": null,
+  "final_balances": null,
+  "first_failure": {"request_id": "req-2", "index": 1, "timestamp": 0.0, "bucket_id": "api_qps", "cost": 4.0, "available": 1.0}
+}
+```
+
+- `available`：满桶起步回放中，该桶在判定时刻（补充之后、扣减之前）的余额。
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
@@ -195,7 +260,7 @@ docker compose up --build
 - **未知引用**：`chain` 引用了未在 `buckets` 中定义的 ID（`unknown_bucket_ref`）；
 - 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate`）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate` 与 `/forecast` 同时生效（按各自字段）。
+以上规则对 `/simulate`、`/forecast` 与 `/plan-initial-balances` 同时生效（按各自字段；`/plan-initial-balances` 与 `/simulate` 共用同一套请求模型）。
 
 ## 本地调用示例
 
@@ -207,6 +272,10 @@ curl -X POST http://localhost:8000/simulate \
 curl -X POST http://localhost:8000/forecast \
   -H 'Content-Type: application/json' \
   -d @examples/forecast.json
+
+curl -X POST http://localhost:8000/plan-initial-balances \
+  -H 'Content-Type: application/json' \
+  -d @examples/plan-initial-balances.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -232,10 +301,12 @@ pytest -q
 │   ├── models.py        # Pydantic 模型与输入校验
 │   ├── simulation.py    # 连续补充 + 原子扣减模拟引擎
 │   ├── forecast.py      # 等待时间预测引擎（不扣减状态）
+│   ├── planner.py       # 初始余额规划引擎（反推最低 initial）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
 ├── examples/forecast.json
+├── examples/plan-initial-balances.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口

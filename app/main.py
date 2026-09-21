@@ -2,12 +2,20 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.errors import RequestValidationErrors
 from app.forecast import forecast
-from app.models import ForecastRequest, ForecastResponse, SimulateRequest, SimulateResponse
+from app.models import (
+    ForecastRequest,
+    ForecastResponse,
+    PlanInitialBalancesResponse,
+    SimulateRequest,
+    SimulateResponse,
+)
+from app.planner import plan_initial_balances
 from app.simulation import simulate
 
 app = FastAPI(
@@ -15,7 +23,8 @@ app = FastAPI(
     description=(
         "接收若干令牌桶与带时间戳的请求序列，按时间顺序模拟连续补充；"
         "仅当请求桶链上所有桶余额充足时原子扣减，否则全部保持不变。"
-        "另提供 /forecast：在不扣减状态的前提下，预测桶链首次同时满足成本所需的等待时间。"
+        "另提供 /forecast：在不扣减状态的前提下，预测桶链首次同时满足成本所需的等待时间；"
+        "以及 /plan-initial-balances：以全部请求放行为目标，反推各桶所需的最低初始余额。"
     ),
     version="1.0.0",
 )
@@ -28,7 +37,8 @@ async def cross_validation_exception_handler(request: Request, exc: RequestValid
 
 @app.exception_handler(RequestValidationError)
 async def pydantic_validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    # jsonable_encoder：校验器抛出的 ValueError 会进入 ctx.error，需转成可序列化形式
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
 @app.get("/", tags=["meta"])
@@ -39,6 +49,7 @@ def root():
         "health": "/health",
         "simulate": "/simulate",
         "forecast": "/forecast",
+        "plan_initial_balances": "/plan-initial-balances",
     }
 
 
@@ -55,3 +66,8 @@ def simulate_endpoint(payload: SimulateRequest) -> SimulateResponse:
 @app.post("/forecast", response_model=ForecastResponse, tags=["forecast"])
 def forecast_endpoint(payload: ForecastRequest) -> ForecastResponse:
     return forecast(payload)
+
+
+@app.post("/plan-initial-balances", response_model=PlanInitialBalancesResponse, tags=["planner"])
+def plan_initial_balances_endpoint(payload: SimulateRequest) -> PlanInitialBalancesResponse:
+    return plan_initial_balances(payload)
