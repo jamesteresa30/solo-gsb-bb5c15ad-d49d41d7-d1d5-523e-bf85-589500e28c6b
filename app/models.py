@@ -335,3 +335,45 @@ class SimulateResponse(BaseModel):
     rejected_count: int
     results: list[SimResult]
     final_balances: Annotated[dict[str, float], Field(description="模拟结束时所有桶的余额")]
+
+
+class PlannedBucket(BaseModel):
+    """单个桶的初始余额规划结果。"""
+
+    id: str
+    requested_initial: Annotated[
+        float, Field(description="请求中给定的初始余额；省略 initial 时等于 capacity")
+    ]
+    required_initial: Annotated[
+        float,
+        Field(description="使该桶全部链上消耗均获放所需的最低初始余额，满足 0 ≤ 值 ≤ capacity"),
+    ]
+    delta: Annotated[
+        float,
+        Field(description="required_initial - requested_initial；正数需补足，负数可下调"),
+    ]
+
+
+class PlanFailure(BaseModel):
+    """满桶起步仍不可行时，按处理顺序首个无法满足的请求定位。"""
+
+    request_id: str
+    index: Annotated[int, Field(description="该请求在原始 requests 数组中的下标")]
+    timestamp: float
+    bucket: Annotated[str, Field(description="该请求链上第一个余额不足的桶 ID")]
+
+
+class PlanResponse(BaseModel):
+    reachable: Annotated[bool, Field(description="是否存在一组 [0, capacity] 内的初始余额使全部请求放行")]
+    failure: Annotated[
+        PlanFailure | None,
+        Field(default=None, description="不可行时首个无法满足的请求与桶；可行时为 null"),
+    ] = None
+    buckets: Annotated[
+        list[PlannedBucket] | None,
+        Field(default=None, description="可行时各桶的规划结果（按 buckets 输入顺序）；不可行时为 null"),
+    ] = None
+    final_balances: Annotated[
+        dict[str, float] | None,
+        Field(default=None, description="可行时，以规划初始余额完整回放得到的终态余额；不可行时为 null"),
+    ] = None

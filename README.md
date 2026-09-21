@@ -9,6 +9,8 @@
 
 另提供 **等待时间预测** 接口 `POST /forecast`：给定当前时刻各桶快照（容量/速率/当前余额）、请求成本与桶链，在**不扣减任何状态**的前提下，计算链上全部桶首次同时满足成本所需的等待秒数，返回预计可通过时刻、等待最长的限制桶与各桶预计余额；零速率或容量不足导致永远不可达时返回明确的不可达标记。
 
+还提供 **初始余额规划** 接口 `POST /plan-initial-balances`：请求体与 `/simulate` 完全一致，目标是让**所有请求均获放行**。服务按相同的时间排序与连续补充语义，为每个桶在 `[0, capacity]` 内反推满足其**全部链上消耗**的最低初始余额，返回各桶 `required_initial`、相对请求 `initial` 的 `delta`，以及用规划值完整回放得到的 `final_balances`；即使在 `/simulate` 中某次请求会因链上其他桶不足而被整体拒绝，规划时该桶自身的消耗仍**全额计入**。若满桶起步仍不可行，返回 `reachable=false` 并指出按处理顺序首个无法满足的请求与桶。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -24,6 +26,7 @@ docker compose up --build
 | 健康检查 | http://localhost:8000/health |
 | 试算接口 | http://localhost:8000/simulate （POST） |
 | 预测接口 | http://localhost:8000/forecast （POST） |
+| 初始余额规划 | http://localhost:8000/plan-initial-balances （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -186,6 +189,76 @@ docker compose up --build
 }
 ```
 
+## 请求格式 `POST /plan-initial-balances`
+
+请求体与字段**完全沿用** `POST /simulate`（`buckets` + `requests`，校验规则也一致，见下文）：
+
+```json
+{
+  "buckets": [
+    {"id": "tenant_quota", "capacity": 100, "refill_rate": 10, "initial": 100},
+    {"id": "api_qps", "capacity": 10, "refill_rate": 5},
+    {"id": "user_quota", "capacity": 20, "refill_rate": 1, "initial": 3}
+  ],
+  "requests": [
+    {"id": "req-1", "timestamp": 0, "cost": 4, "chain": ["tenant_quota", "api_qps", "user_quota"]},
+    {"id": "req-2", "timestamp": 1, "cost": 4, "chain": ["tenant_quota", "api_qps"]},
+    {"id": "req-3", "timestamp": 2, "cost": 4, "chain": ["tenant_quota", "api_qps", "user_quota"]}
+  ]
+}
+```
+
+### 规划语义
+
+1. **目标全量放行**：处理顺序与 `/simulate` 一致（按 `timestamp` 升序、同刻按输入顺序），连续补充与封顶规则也完全相同；规划目标是让每个请求链上的所有桶在判定时刻都 `余额 >= cost`。
+2. **链上消耗全量计入**：每个桶独立承担自己参与的**每一次**请求的 `cost`。即使某次请求在 `/simulate` 中会因链上其他桶不足而被原子拒绝（该桶不扣），规划时该桶自身的消耗仍照常计入，不会因其他桶暂时不足而跳过。
+3. **最低初始余额（逆序归纳）**：对桶的事件序列 `(t_k, c_k)`，令末事件后余额恰为 0，逐事件叠加补充无法覆盖的缺口：
+
+   ```
+   req_n = c_n
+   req_k = c_k + max(0, req_{k+1} - refill_rate × (t_{k+1} - t_k))
+   initial = clamp(0, req_1 - refill_rate × (t_1 - t_start), capacity)
+   ```
+
+   其中 `t_start` 为最早请求时间戳（首事件之前的连续补充同样封顶 `capacity`）。结果满足 `0 ≤ required_initial ≤ capacity`，与真实最低值误差不超过 1e-6；未被任何请求引用的桶 `required_initial = 0`。
+4. **不可行判定**：满桶（`initial = capacity`）是初始余额的上界。以满桶起步完整回放，若仍有请求被拒，则不存在可行解，返回 `reachable = false`，并给出按处理顺序首个被拒请求的 `request_id` / `index` / `timestamp` 与其链上第一个不足的桶 `bucket`；此时 `buckets` 与 `final_balances` 为 `null`。
+5. **完整回放**：可行时服务会用规划出的 `required_initial` 替换请求中的 `initial` 再跑一遍 `/simulate`，确认全部请求放行，并把终态写入 `final_balances`；`delta = required_initial - requested_initial`（正数需补足、负数可下调），省略 `initial` 时 `requested_initial` 取 `capacity`。
+
+### 响应示例（可行，对应 `examples/plan.json`）
+
+```json
+{
+  "reachable": true,
+  "failure": null,
+  "buckets": [
+    {"id": "tenant_quota", "requested_initial": 100.0, "required_initial": 4.0, "delta": -96.0},
+    {"id": "api_qps", "requested_initial": 10.0, "required_initial": 4.0, "delta": -6.0},
+    {"id": "user_quota", "requested_initial": 3.0, "required_initial": 6.0, "delta": 3.0}
+  ],
+  "final_balances": {"tenant_quota": 12.0, "api_qps": 2.0, "user_quota": 0.0}
+}
+```
+
+最低初始不保证终态为 0：事件间隔的补充若超过下一跳缺口会在回放中结余（如 `tenant_quota`）。
+
+### 响应示例（不可行：零补充桶容量只够一次消耗）
+
+请求：桶 `A`（`capacity = 3, refill_rate = 0`，默认满桶），`t=0` 扣 3、`t=100` 再扣 1。
+
+```json
+{
+  "reachable": false,
+  "failure": {
+    "request_id": "r2",
+    "index": 1,
+    "timestamp": 100.0,
+    "bucket": "A"
+  },
+  "buckets": null,
+  "final_balances": null
+}
+```
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
@@ -193,9 +266,9 @@ docker compose up --build
 - **重复桶**：`buckets[].id` 重复（`duplicate_bucket`）；
 - **非法速率/容量**：`capacity <= 0`、`refill_rate < 0`、非有限数值、`initial`/`balance` 越界；
 - **未知引用**：`chain` 引用了未在 `buckets` 中定义的 ID（`unknown_bucket_ref`）；
-- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate`）、多余字段（`extra="forbid"`）。
+- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，`/simulate` 与 `/plan-initial-balances`）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate` 与 `/forecast` 同时生效（按各自字段）。
+以上规则对 `/simulate`、`/plan-initial-balances` 与 `/forecast` 同时生效（前两者共用同一请求体，按各自字段）。
 
 ## 本地调用示例
 
@@ -207,6 +280,10 @@ curl -X POST http://localhost:8000/simulate \
 curl -X POST http://localhost:8000/forecast \
   -H 'Content-Type: application/json' \
   -d @examples/forecast.json
+
+curl -X POST http://localhost:8000/plan-initial-balances \
+  -H 'Content-Type: application/json' \
+  -d @examples/plan.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -232,10 +309,12 @@ pytest -q
 │   ├── models.py        # Pydantic 模型与输入校验
 │   ├── simulation.py    # 连续补充 + 原子扣减模拟引擎
 │   ├── forecast.py      # 等待时间预测引擎（不扣减状态）
+│   ├── planning.py      # 初始余额规划引擎（逆序反推最低初始）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
 ├── examples/forecast.json
+├── examples/plan.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口
